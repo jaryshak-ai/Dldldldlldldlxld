@@ -1,0 +1,757 @@
+name: Build EclipsClips
+
+on:
+  workflow_dispatch:
+  push:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Set up Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Create project files
+        run: |
+          mkdir -p build/src/main/java/ru/eclips/clips build/src/main/resources
+          cat > build/pom.xml <<'EOF_FILE'
+          <?xml version="1.0" encoding="UTF-8"?>
+          <project xmlns="http://maven.apache.org/POM/4.0.0"
+                   xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+                   xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd">
+              <modelVersion>4.0.0</modelVersion>
+              <groupId>ru.eclips</groupId>
+              <artifactId>EclipsClips</artifactId>
+              <version>1.0.0</version>
+              <packaging>jar</packaging>
+              <properties>
+                  <maven.compiler.source>17</maven.compiler.source>
+                  <maven.compiler.target>17</maven.compiler.target>
+                  <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
+              </properties>
+              <repositories>
+                  <repository>
+                      <id>lanink</id>
+                      <url>https://repo.lanink.cn/repository/maven-public/</url>
+                  </repository>
+              </repositories>
+              <dependencies>
+                  <dependency>
+                      <groupId>cn.nukkit</groupId>
+                      <artifactId>Nukkit</artifactId>
+                      <version>MOT-SNAPSHOT</version>
+                      <scope>provided</scope>
+                  </dependency>
+              </dependencies>
+              <build>
+                  <finalName>EclipsClips-${project.version}</finalName>
+                  <plugins>
+                      <plugin>
+                          <groupId>org.apache.maven.plugins</groupId>
+                          <artifactId>maven-compiler-plugin</artifactId>
+                          <version>3.11.0</version>
+                          <configuration>
+                              <release>17</release>
+                              <encoding>UTF-8</encoding>
+                          </configuration>
+                      </plugin>
+                  </plugins>
+              </build>
+          </project>
+          EOF_FILE
+          cat > build/src/main/resources/plugin.yml <<'EOF_FILE'
+          name: EclipsClips
+          main: ru.eclips.clips.EclipsClips
+          version: "1.0.0"
+          api: ["1.0.0"]
+          author: jaryshak
+          description: Currency "Clips" - API, /givec admin menu, {clips} for EclipsBoard
+          softdepend: [EclipsBoard]
+
+          commands:
+            givec:
+              description: Give or take clips (admin menu)
+              usage: /givec  or  /givec <give|take> <nick> <amount>
+              permission: eclipsclips.admin
+            clips:
+              description: Show clips balance
+              usage: /clips
+              permission: eclipsclips.balance
+
+          permissions:
+            eclipsclips.admin:
+              description: Give and take clips
+              default: op
+            eclipsclips.balance:
+              description: Show own clips balance
+              default: true
+          EOF_FILE
+          cat > build/src/main/resources/config.yml <<'EOF_FILE'
+          # EclipsClips
+          # Максимум клипсов за одну операцию /givec (выдать или забрать)
+          admin-limit: 100000
+          EOF_FILE
+          cat > build/src/main/java/ru/eclips/clips/EclipsClips.java <<'EOF_FILE'
+          package ru.eclips.clips;
+
+          import cn.nukkit.Player;
+          import cn.nukkit.command.Command;
+          import cn.nukkit.command.CommandSender;
+          import cn.nukkit.event.EventHandler;
+          import cn.nukkit.event.EventPriority;
+          import cn.nukkit.event.Listener;
+          import cn.nukkit.event.player.PlayerJoinEvent;
+          import cn.nukkit.event.server.DataPacketSendEvent;
+          import cn.nukkit.network.protocol.DataPacket;
+          import cn.nukkit.network.protocol.SetScorePacket;
+          import cn.nukkit.plugin.Plugin;
+          import cn.nukkit.plugin.PluginBase;
+          import cn.nukkit.scheduler.Task;
+          import com.google.gson.Gson;
+          import com.google.gson.GsonBuilder;
+          import com.google.gson.reflect.TypeToken;
+
+          import java.io.File;
+          import java.io.Reader;
+          import java.io.Writer;
+          import java.lang.reflect.Field;
+          import java.lang.reflect.Method;
+          import java.lang.reflect.Modifier;
+          import java.nio.charset.StandardCharsets;
+          import java.nio.file.Files;
+          import java.nio.file.StandardCopyOption;
+          import java.util.ArrayList;
+          import java.util.LinkedHashMap;
+          import java.util.List;
+          import java.util.Locale;
+          import java.util.Map;
+
+          /**
+           * EclipsClips: валюта "Клипсы".
+           *
+           * API для других плагинов:
+           *   EclipsClips c = EclipsClips.getInstance();
+           *   c.getClips("Nick");  c.has("Nick", 50);  c.addClips("Nick", 50);  c.takeClips("Nick", 50);  c.setClips("Nick", 0);
+           * Ник регистронезависим. addClips создаёт счёт, если его нет. takeClips возвращает false, если не хватает.
+           *
+           * Для EclipsBoard: в её config.yml в свободную строку (lines) пишем  "&fКлипсы: &d{clips}"
+           */
+          public class EclipsClips extends PluginBase implements Listener {
+
+              public static final String PERM_ADMIN = "eclipsclips.admin";
+              public static final String PLACEHOLDER = "{clips}";
+              public static final String PREFIX = "§d[Клипсы]§r ";
+              public static final long MAX_BALANCE = 1_000_000_000_000_000L;
+
+              private static EclipsClips instance;
+
+              static final class Account {
+                  String name;
+                  long balance;
+              }
+
+              private final Gson gson = new GsonBuilder().setPrettyPrinting().create();
+              private final Map<String, Account> accounts = new LinkedHashMap<>();
+              private File dataFile;
+              private boolean dirty;
+              private long adminLimit = 100000L;
+
+              private Field[] scoreStringFields;
+              private Plugin boardPlugin;
+              private Method boardUpdate;
+              private boolean boardFailed;
+
+              public static EclipsClips getInstance() {
+                  return instance;
+              }
+
+              // ------------------------------------------------------------------ жизненный цикл
+
+              @Override
+              public void onEnable() {
+                  instance = this;
+                  saveDefaultConfig();
+                  adminLimit = Math.max(1L, getConfig().getLong("admin-limit", 100000L));
+                  dataFile = new File(getDataFolder(), "clips.json");
+                  loadData();
+
+                  getServer().getPluginManager().registerEvents(this, this);
+                  getServer().getPluginManager().registerEvents(new ClipsMenu(this), this);
+
+                  getServer().getScheduler().scheduleRepeatingTask(this, new Task() {
+                      @Override
+                      public void onRun(int currentTick) {
+                          saveIfDirty();
+                      }
+                  }, 20 * 30);
+
+                  getLogger().info("EclipsClips включён. Счетов: " + accounts.size() + ", лимит админа за раз: " + adminLimit);
+              }
+
+              @Override
+              public void onDisable() {
+                  saveIfDirty();
+              }
+
+              public long getAdminLimit() {
+                  return adminLimit;
+              }
+
+              // ------------------------------------------------------------------ API
+
+              public static String key(String name) {
+                  return name == null ? "" : name.trim().toLowerCase(Locale.ROOT);
+              }
+
+              public synchronized boolean hasAccount(String name) {
+                  return accounts.containsKey(key(name));
+              }
+
+              /** Имя в том регистре, как игрок заходил на сервер, или null если счёта нет. */
+              public synchronized String getAccountName(String name) {
+                  Account a = accounts.get(key(name));
+                  return a == null ? null : a.name;
+              }
+
+              public synchronized long getClips(String name) {
+                  Account a = accounts.get(key(name));
+                  return a == null ? 0L : a.balance;
+              }
+
+              public long getClips(Player p) {
+                  return p == null ? 0L : getClips(p.getName());
+              }
+
+              public synchronized boolean has(String name, long amount) {
+                  return amount >= 0 && getClips(name) >= amount;
+              }
+
+              /** Начислить. false если amount <= 0 или переполнение. Счёт создаётся автоматически. */
+              public boolean addClips(String name, long amount) {
+                  if (amount <= 0 || key(name).isEmpty()) return false;
+                  synchronized (this) {
+                      Account a = account(name, true);
+                      long nv;
+                      try {
+                          nv = Math.addExact(a.balance, amount);
+                      } catch (ArithmeticException ex) {
+                          return false;
+                      }
+                      if (nv > MAX_BALANCE) return false;
+                      a.balance = nv;
+                      dirty = true;
+                  }
+                  refreshBoard(name);
+                  return true;
+              }
+
+              /** Списать. false если amount <= 0 или не хватает клипсов (тогда ничего не меняется). */
+              public boolean takeClips(String name, long amount) {
+                  if (amount <= 0) return false;
+                  synchronized (this) {
+                      Account a = account(name, false);
+                      if (a == null || a.balance < amount) return false;
+                      a.balance -= amount;
+                      dirty = true;
+                  }
+                  refreshBoard(name);
+                  return true;
+              }
+
+              /** Установить точное значение (>= 0). */
+              public boolean setClips(String name, long amount) {
+                  if (amount < 0 || amount > MAX_BALANCE || key(name).isEmpty()) return false;
+                  synchronized (this) {
+                      account(name, true).balance = amount;
+                      dirty = true;
+                  }
+                  refreshBoard(name);
+                  return true;
+              }
+
+              public static String format(long v) {
+                  return String.format(Locale.US, "%,d", v).replace(',', ' ');
+              }
+
+              private Account account(String name, boolean create) {
+                  String k = key(name);
+                  Account a = accounts.get(k);
+                  if (a == null && create) {
+                      a = new Account();
+                      a.name = name.trim();
+                      a.balance = 0L;
+                      accounts.put(k, a);
+                      dirty = true;
+                  }
+                  return a;
+              }
+
+              // ------------------------------------------------------------------ события
+
+              @EventHandler
+              public void onJoin(PlayerJoinEvent e) {
+                  Player p = e.getPlayer();
+                  synchronized (this) {
+                      Account a = account(p.getName(), true);
+                      if (!p.getName().equals(a.name)) {
+                          a.name = p.getName();
+                          dirty = true;
+                      }
+                  }
+              }
+
+              /**
+               * Доску (EclipsBoard) не трогаем: подставляем {clips} в исходящий пакет строк прямо на лету.
+               */
+              @EventHandler(priority = EventPriority.HIGHEST, ignoreCancelled = true)
+              public void onSend(DataPacketSendEvent e) {
+                  try {
+                      DataPacket pk = e.getPacket();
+                      if (!(pk instanceof SetScorePacket)) return;
+                      SetScorePacket sp = (SetScorePacket) pk;
+                      if (sp.infos == null || sp.infos.isEmpty()) return;
+                      String value = format(getClips(e.getPlayer()));
+                      for (Object info : sp.infos) {
+                          if (info == null) continue;
+                          if (scoreStringFields == null) {
+                              List<Field> fs = new ArrayList<>();
+                              for (Field f : info.getClass().getDeclaredFields()) {
+                                  if (f.getType() == String.class && !Modifier.isStatic(f.getModifiers())) {
+                                      f.setAccessible(true);
+                                      fs.add(f);
+                                  }
+                              }
+                              scoreStringFields = fs.toArray(new Field[0]);
+                          }
+                          for (Field f : scoreStringFields) {
+                              Object cur = f.get(info);
+                              if (cur instanceof String && ((String) cur).contains(PLACEHOLDER)) {
+                                  f.set(info, ((String) cur).replace(PLACEHOLDER, value));
+                              }
+                          }
+                      }
+                  } catch (Throwable t) {
+                      // доска не должна ломаться из-за нас
+                  }
+              }
+
+              /** Просим доску сразу перерисоваться (иначе значение обновится по её full-refresh-seconds). */
+              private void refreshBoard(String name) {
+                  if (boardFailed) return;
+                  try {
+                      Player p = getServer().getPlayerExact(name);
+                      if (p == null) return;
+                      if (boardUpdate == null) {
+                          Plugin b = getServer().getPluginManager().getPlugin("EclipsBoard");
+                          if (b == null || !b.isEnabled()) return;
+                          Method m = b.getClass().getDeclaredMethod("update", Player.class, boolean.class);
+                          m.setAccessible(true);
+                          boardPlugin = b;
+                          boardUpdate = m;
+                      }
+                      boardUpdate.invoke(boardPlugin, p, true);
+                  } catch (Throwable t) {
+                      boardFailed = true;
+                  }
+              }
+
+              // ------------------------------------------------------------------ команды
+
+              @Override
+              public boolean onCommand(CommandSender sender, Command cmd, String label, String[] args) {
+                  String n = cmd.getName().toLowerCase(Locale.ROOT);
+                  if (n.equals("clips")) {
+                      if (args.length == 0) {
+                          if (!(sender instanceof Player)) {
+                              sender.sendMessage("Использование: /clips <ник>");
+                              return true;
+                          }
+                          sender.sendMessage(PREFIX + "Ваш баланс: §d" + format(getClips((Player) sender)));
+                          return true;
+                      }
+                      if (!sender.hasPermission(PERM_ADMIN)) {
+                          sender.sendMessage(PREFIX + "§cНет прав.");
+                          return true;
+                      }
+                      String nm = getAccountName(args[0]);
+                      if (nm == null) {
+                          sender.sendMessage(PREFIX + "§cИгрок не найден.");
+                          return true;
+                      }
+                      sender.sendMessage(PREFIX + nm + ": §d" + format(getClips(nm)));
+                      return true;
+                  }
+                  if (n.equals("givec")) {
+                      if (!sender.hasPermission(PERM_ADMIN)) {
+                          sender.sendMessage(PREFIX + "§cНет прав.");
+                          return true;
+                      }
+                      if (args.length == 0) {
+                          if (sender instanceof Player) {
+                              ClipsMenu.open(this, (Player) sender);
+                          } else {
+                              sender.sendMessage("Использование: /givec <give|take> <ник> <сумма>");
+                          }
+                          return true;
+                      }
+                      return givecText(sender, args);
+                  }
+                  return false;
+              }
+
+              private boolean givecText(CommandSender s, String[] a) {
+                  if (a.length < 3) {
+                      s.sendMessage(PREFIX + "Использование: /givec <give|take> <ник> <сумма>");
+                      return true;
+                  }
+                  boolean take;
+                  String m = a[0].toLowerCase(Locale.ROOT);
+                  if (m.equals("give") || m.equals("add")) take = false;
+                  else if (m.equals("take") || m.equals("remove")) take = true;
+                  else {
+                      s.sendMessage(PREFIX + "Использование: /givec <give|take> <ник> <сумма>");
+                      return true;
+                  }
+                  String nm = getAccountName(a[1]);
+                  if (nm == null) {
+                      s.sendMessage(PREFIX + "§cИгрок не найден (он должен был хотя бы раз зайти).");
+                      return true;
+                  }
+                  long amount = ClipsMenu.parseAmount(a[2]);
+                  if (amount < 1 || amount > adminLimit) {
+                      s.sendMessage(PREFIX + "§cСумма: от 1 до " + format(adminLimit));
+                      return true;
+                  }
+                  s.sendMessage(PREFIX + applyAdmin(s.getName(), nm, take, amount));
+                  return true;
+              }
+
+              /** Выдать/забрать от лица админа + уведомление игроку + лог. Возвращает текст для админа. */
+              String applyAdmin(String adminName, String target, boolean take, long amount) {
+                  boolean ok = take ? takeClips(target, amount) : addClips(target, amount);
+                  if (!ok) {
+                      return take ? "§cНе удалось: у игрока только " + format(getClips(target))
+                              : "§cНе удалось выдать (переполнение счёта).";
+                  }
+                  Player tp = getServer().getPlayerExact(target);
+                  if (tp != null) {
+                      tp.sendMessage(PREFIX + (take ? "§cУ вас забрали " : "§aВам выдали ")
+                              + "§d" + format(amount) + "§r клипсов. Баланс: §d" + format(getClips(target)));
+                  }
+                  getLogger().info(adminName + (take ? " забрал " : " выдал ") + amount + " клипсов " + (take ? "у " : "игроку ")
+                          + target + " (баланс: " + getClips(target) + ")");
+                  return (take ? "§aЗабрано " : "§aВыдано ") + "§d" + format(amount) + "§a клипсов "
+                          + (take ? "у " : "игроку ") + target + ". Баланс: §d" + format(getClips(target));
+              }
+
+              // ------------------------------------------------------------------ хранилище
+
+              private synchronized void loadData() {
+                  accounts.clear();
+                  if (!dataFile.exists()) return;
+                  try (Reader r = new java.io.InputStreamReader(Files.newInputStream(dataFile.toPath()), StandardCharsets.UTF_8)) {
+                      Map<String, Account> m = gson.fromJson(r, new TypeToken<Map<String, Account>>() {
+                      }.getType());
+                      if (m != null) {
+                          for (Map.Entry<String, Account> en : m.entrySet()) {
+                              if (en.getValue() != null) accounts.put(en.getKey(), en.getValue());
+                          }
+                      }
+                  } catch (Exception ex) {
+                      getLogger().error("Не удалось прочитать clips.json: " + ex);
+                  }
+              }
+
+              private void saveIfDirty() {
+                  String json;
+                  synchronized (this) {
+                      if (!dirty) return;
+                      json = gson.toJson(accounts);
+                      dirty = false;
+                  }
+                  try {
+                      getDataFolder().mkdirs();
+                      File tmp = new File(getDataFolder(), "clips.json.tmp");
+                      try (Writer w = new java.io.OutputStreamWriter(Files.newOutputStream(tmp.toPath()), StandardCharsets.UTF_8)) {
+                          w.write(json);
+                      }
+                      Files.move(tmp.toPath(), dataFile.toPath(), StandardCopyOption.REPLACE_EXISTING);
+                  } catch (Exception ex) {
+                      synchronized (this) {
+                          dirty = true;
+                      }
+                      getLogger().error("Не удалось сохранить clips.json: " + ex);
+                  }
+              }
+          }
+          EOF_FILE
+          cat > build/src/main/java/ru/eclips/clips/ClipsMenu.java <<'EOF_FILE'
+          package ru.eclips.clips;
+
+          import cn.nukkit.Player;
+          import cn.nukkit.event.EventHandler;
+          import cn.nukkit.event.Listener;
+          import cn.nukkit.event.player.PlayerFormRespondedEvent;
+          import cn.nukkit.event.player.PlayerQuitEvent;
+          import cn.nukkit.form.element.Element;
+          import cn.nukkit.form.element.ElementButton;
+          import cn.nukkit.form.element.ElementDropdown;
+          import cn.nukkit.form.element.ElementInput;
+          import cn.nukkit.form.element.ElementLabel;
+          import cn.nukkit.form.response.FormResponseCustom;
+          import cn.nukkit.form.response.FormResponseModal;
+          import cn.nukkit.form.response.FormResponseSimple;
+          import cn.nukkit.form.window.FormWindow;
+          import cn.nukkit.form.window.FormWindowCustom;
+          import cn.nukkit.form.window.FormWindowModal;
+          import cn.nukkit.form.window.FormWindowSimple;
+
+          import java.util.ArrayList;
+          import java.util.Collections;
+          import java.util.IdentityHashMap;
+          import java.util.Iterator;
+          import java.util.List;
+          import java.util.Map;
+          import java.util.UUID;
+
+          /**
+           * Меню /givec:
+           *  1) Забрать / Выдать
+           *  2) Ввести ник / Выбрать из онлайна
+           *  3) Сумма (лимит за раз из config.yml, по умолчанию 100000) -> окно "Подтвердить / Отмена"
+           */
+          final class ClipsMenu implements Listener {
+
+              private static final String CONFIRM = "Подтвердить";
+              private static final String CANCEL = "Отмена";
+
+              private enum Step { MAIN, TYPE, NICK, ONLINE, CONFIRM }
+
+              private static final class Ctx {
+                  Step step;
+                  UUID uid;
+                  boolean take;
+                  List<String> online;
+                  String target;
+                  long amount;
+              }
+
+              private static ClipsMenu self;
+
+              private final EclipsClips pl;
+              private final Map<FormWindow, Ctx> forms = Collections.synchronizedMap(new IdentityHashMap<>());
+
+              ClipsMenu(EclipsClips pl) {
+                  this.pl = pl;
+                  self = this;
+              }
+
+              static void open(EclipsClips pl, Player p) {
+                  if (self != null) self.openMain(p);
+              }
+
+              /** "1 000", "1,000", "1_000" -> 1000. Ошибка -> -1. */
+              static long parseAmount(String s) {
+                  if (s == null) return -1;
+                  String t = s.replace(" ", "").replace(",", "").replace("_", "").trim();
+                  if (t.isEmpty() || t.length() > 18) return -1;
+                  for (int i = 0; i < t.length(); i++) {
+                      if (t.charAt(i) < '0' || t.charAt(i) > '9') return -1;
+                  }
+                  try {
+                      return Long.parseLong(t);
+                  } catch (NumberFormatException e) {
+                      return -1;
+                  }
+              }
+
+              private void show(Player p, FormWindow w, Step step, boolean take) {
+                  Ctx c = new Ctx();
+                  c.step = step;
+                  c.uid = p.getUniqueId();
+                  c.take = take;
+                  forms.put(w, c);
+                  p.showFormWindow(w);
+              }
+
+              private void showCtx(Player p, FormWindow w, Ctx c) {
+                  forms.put(w, c);
+                  p.showFormWindow(w);
+              }
+
+              // ------------------------------------------------------------------ шаги
+
+              private void openMain(Player p) {
+                  FormWindowSimple w = new FormWindowSimple("Клипсы", "Что сделать?");
+                  w.addButton(new ElementButton("Забрать клипсы у игрока"));
+                  w.addButton(new ElementButton("Выдать клипсы игроку"));
+                  show(p, w, Step.MAIN, false);
+              }
+
+              private void openType(Player p, boolean take) {
+                  FormWindowSimple w = new FormWindowSimple(take ? "Забрать клипсы" : "Выдать клипсы", "Выберите игрока:");
+                  w.addButton(new ElementButton("Ввести ник"));
+                  w.addButton(new ElementButton("Выбрать из игроков онлайн"));
+                  show(p, w, Step.TYPE, take);
+              }
+
+              private String hint() {
+                  return "Лимит за один раз: " + EclipsClips.format(pl.getAdminLimit());
+              }
+
+              private void openNick(Player p, boolean take, String err, String nickDef, String amtDef) {
+                  List<Element> el = new ArrayList<>();
+                  el.add(new ElementLabel((err == null ? "" : "§c" + err + "\n") + hint()));
+                  el.add(new ElementInput("Ник игрока", "Например: Steve", nickDef == null ? "" : nickDef));
+                  el.add(new ElementInput("Сумма", "1 - " + pl.getAdminLimit(), amtDef == null ? "" : amtDef));
+                  show(p, new FormWindowCustom(take ? "Забрать клипсы" : "Выдать клипсы", el), Step.NICK, take);
+              }
+
+              private void openOnline(Player p, boolean take, String err, String amtDef) {
+                  List<String> names = new ArrayList<>();
+                  for (Player o : pl.getServer().getOnlinePlayers().values()) names.add(o.getName());
+                  if (names.isEmpty()) {
+                      p.sendMessage(EclipsClips.PREFIX + "§cНет игроков онлайн.");
+                      return;
+                  }
+                  List<Element> el = new ArrayList<>();
+                  el.add(new ElementLabel((err == null ? "" : "§c" + err + "\n") + hint()));
+                  el.add(new ElementDropdown("Игрок", names, 0));
+                  el.add(new ElementInput("Сумма", "1 - " + pl.getAdminLimit(), amtDef == null ? "" : amtDef));
+                  FormWindowCustom w = new FormWindowCustom(take ? "Забрать клипсы" : "Выдать клипсы", el);
+                  Ctx c = new Ctx();
+                  c.step = Step.ONLINE;
+                  c.uid = p.getUniqueId();
+                  c.take = take;
+                  c.online = names;
+                  showCtx(p, w, c);
+              }
+
+              private void openConfirm(Player p, boolean take, String target, long amount) {
+                  String text = (take ? "Забрать " : "Выдать ") + "§d" + EclipsClips.format(amount) + "§r клипсов "
+                          + (take ? "у игрока " : "игроку ") + "§e" + target + "§r?\n\nСейчас у него: §d"
+                          + EclipsClips.format(pl.getClips(target));
+                  FormWindowModal w = new FormWindowModal("Подтверждение", text, CONFIRM, CANCEL);
+                  Ctx c = new Ctx();
+                  c.step = Step.CONFIRM;
+                  c.uid = p.getUniqueId();
+                  c.take = take;
+                  c.target = target;
+                  c.amount = amount;
+                  showCtx(p, w, c);
+              }
+
+              // ------------------------------------------------------------------ обработка ответов
+
+              @EventHandler
+              public void onForm(PlayerFormRespondedEvent e) {
+                  Ctx c = forms.remove(e.getWindow());
+                  if (c == null) return;
+                  Player p = e.getPlayer();
+                  if (e.wasClosed() || e.getResponse() == null) return;
+                  if (!p.hasPermission(EclipsClips.PERM_ADMIN)) {
+                      p.sendMessage(EclipsClips.PREFIX + "§cНет прав.");
+                      return;
+                  }
+                  switch (c.step) {
+                      case MAIN: {
+                          int id = ((FormResponseSimple) e.getResponse()).getClickedButtonId();
+                          openType(p, id == 0); // 0 = забрать, 1 = выдать
+                          break;
+                      }
+                      case TYPE: {
+                          int id = ((FormResponseSimple) e.getResponse()).getClickedButtonId();
+                          if (id == 0) openNick(p, c.take, null, null, null);
+                          else openOnline(p, c.take, null, null);
+                          break;
+                      }
+                      case NICK: {
+                          FormResponseCustom r = (FormResponseCustom) e.getResponse();
+                          String nick = r.getInputResponse(1);
+                          String amt = r.getInputResponse(2);
+                          String target = pl.getAccountName(nick);
+                          if (target == null) {
+                              openNick(p, c.take, "Игрок не найден (он должен был хотя бы раз зайти на сервер).", nick, amt);
+                              break;
+                          }
+                          String err = checkAmount(c.take, target, amt);
+                          if (err != null) {
+                              openNick(p, c.take, err, nick, amt);
+                              break;
+                          }
+                          openConfirm(p, c.take, target, parseAmount(amt));
+                          break;
+                      }
+                      case ONLINE: {
+                          FormResponseCustom r = (FormResponseCustom) e.getResponse();
+                          int idx = r.getDropdownResponse(1).getElementID();
+                          String amt = r.getInputResponse(2);
+                          if (c.online == null || idx < 0 || idx >= c.online.size()) {
+                              openOnline(p, c.take, "Игрок не выбран.", amt);
+                              break;
+                          }
+                          String target = pl.getAccountName(c.online.get(idx));
+                          if (target == null) target = c.online.get(idx);
+                          String err = checkAmount(c.take, target, amt);
+                          if (err != null) {
+                              openOnline(p, c.take, err, amt);
+                              break;
+                          }
+                          openConfirm(p, c.take, target, parseAmount(amt));
+                          break;
+                      }
+                      case CONFIRM: {
+                          FormResponseModal r = (FormResponseModal) e.getResponse();
+                          if (!CONFIRM.equals(r.getClickedButtonText())) {
+                              p.sendMessage(EclipsClips.PREFIX + "Отменено.");
+                              break;
+                          }
+                          long lim = pl.getAdminLimit();
+                          if (c.amount < 1 || c.amount > lim) {
+                              p.sendMessage(EclipsClips.PREFIX + "§cНеверная сумма.");
+                              break;
+                          }
+                          p.sendMessage(EclipsClips.PREFIX + pl.applyAdmin(p.getName(), c.target, c.take, c.amount));
+                          break;
+                      }
+                      default:
+                          break;
+                  }
+              }
+
+              /** null = всё ок. */
+              private String checkAmount(boolean take, String target, String amtRaw) {
+                  long a = parseAmount(amtRaw);
+                  long lim = pl.getAdminLimit();
+                  if (a < 1) return "Введите целое число больше нуля.";
+                  if (a > lim) return "Максимум за один раз: " + EclipsClips.format(lim);
+                  if (take && pl.getClips(target) < a) {
+                      return "У игрока только " + EclipsClips.format(pl.getClips(target)) + " клипсов.";
+                  }
+                  return null;
+              }
+
+              @EventHandler
+              public void onQuit(PlayerQuitEvent e) {
+                  UUID id = e.getPlayer().getUniqueId();
+                  synchronized (forms) {
+                      Iterator<Ctx> it = forms.values().iterator();
+                      while (it.hasNext()) {
+                          if (id.equals(it.next().uid)) it.remove();
+                      }
+                  }
+              }
+          }
+          EOF_FILE
+
+      - name: Build jar
+        run: mvn -B -f build/pom.xml package
+
+      - name: Upload jar
+        uses: actions/upload-artifact@v4
+        with:
+          name: EclipsClips
+          path: build/target/EclipsClips-1.0.0.jar
